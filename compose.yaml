@@ -1,0 +1,33 @@
+name: inteli-dev-kiki-assistant-kernel-api
+
+services:
+  kernel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: inteli-dev-kiki-assistant-kernel-api:0.1.0
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${KERNEL_PORT:-8090}:8080"
+    volumes:
+      - kernel-data:/data
+    networks:
+      - assistant
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  assistant:
+    name: inteli-dev-assistant
+    driver: bridge
+
+volumes:
+  kernel-data:
+    name: inteli-dev-kernel-data

@@ -1,0 +1,163 @@
+//! Environment configuration for the assistant kernel.
+//!
+//! The kernel is a separate deployable. It never reads the site or CRM
+//! databases directly. Channel providers are addressed through service-token
+//! protected HTTP endpoints, and the kernel owns only conversations, usage and
+//! audit data.
+
+use std::env;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+#[derive(Clone, Debug)]
+pub struct ModelConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub timeout: Duration,
+}
+
+impl ModelConfig {
+    fn from_env(prefix: &str, default_model: &str) -> Self {
+        let base_url = env::var(format!("KERNEL_{prefix}_BASE_URL")).unwrap_or_default();
+        let api_key = env::var(format!("KERNEL_{prefix}_API_KEY")).unwrap_or_default();
+        let model = env::var(format!("KERNEL_{prefix}_MODEL"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_model.to_string());
+        let timeout = env::var(format!("KERNEL_{prefix}_TIMEOUT_SECONDS"))
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60);
+
+        Self {
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
+            api_key,
+            model,
+            timeout: Duration::from_secs(timeout.max(1)),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.is_empty() && !self.model.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderConfig {
+    /// Base URL includes `/internal/assistant`, for example
+    /// `http://web:8080/internal/assistant`.
+    pub base_url: String,
+    /// Token used by the kernel when calling the channel provider.
+    pub token: String,
+}
+
+impl ProviderConfig {
+    fn from_env(prefix: &str) -> Self {
+        Self {
+            base_url: env::var(format!("KERNEL_{prefix}_PROVIDER_URL"))
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches('/')
+                .to_string(),
+            token: env::var(format!("KERNEL_{prefix}_PROVIDER_TOKEN")).unwrap_or_default(),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.is_empty() && !self.token.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub bind: SocketAddr,
+    pub database_url: String,
+    pub cloud: ModelConfig,
+    pub local: ModelConfig,
+    pub site: ProviderConfig,
+    pub crm: ProviderConfig,
+    /// Inbound token for the site BFF. Empty means the channel is disabled.
+    pub site_token: String,
+    /// Inbound token for the CRM BFF. Empty means the channel is disabled.
+    pub crm_token: String,
+    pub max_tool_steps: usize,
+    pub max_message_chars: usize,
+    /// Never true in production for real secret data. It exists for local
+    /// development when the local llama.cpp endpoint is not running yet.
+    pub allow_cloud_for_internal: bool,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self, String> {
+        let bind = env::var("KERNEL_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        let bind: SocketAddr = bind
+            .parse()
+            .map_err(|error| format!("KERNEL_BIND is invalid: {error}"))?;
+
+        let database_url = env::var("KERNEL_DATABASE_URL")
+            .unwrap_or_else(|_| "sqlite:///data/kernel.db?mode=rwc".to_string());
+
+        let max_tool_steps = env::var("KERNEL_MAX_TOOL_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4usize)
+            .clamp(1, 8);
+        let max_message_chars = env::var("KERNEL_MAX_MESSAGE_CHARS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8000usize)
+            .clamp(1, 32_000);
+        let allow_cloud_for_internal = env::var("KERNEL_ALLOW_CLOUD_FOR_INTERNAL")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        Ok(Self {
+            bind,
+            database_url,
+            cloud: ModelConfig::from_env("CLOUD", "deepseek-chat"),
+            local: ModelConfig::from_env("LOCAL", "local-model"),
+            site: ProviderConfig::from_env("SITE"),
+            crm: ProviderConfig::from_env("CRM"),
+            site_token: env::var("KERNEL_SITE_TOKEN").unwrap_or_default(),
+            crm_token: env::var("KERNEL_CRM_TOKEN").unwrap_or_default(),
+            max_tool_steps,
+            max_message_chars,
+            allow_cloud_for_internal,
+        })
+    }
+
+    pub fn provider(&self, channel: &str) -> Option<&ProviderConfig> {
+        match channel {
+            "site" => Some(&self.site),
+            "crm" => Some(&self.crm),
+            _ => None,
+        }
+    }
+
+    pub fn inbound_token(&self, channel: &str) -> Option<&str> {
+        let token = match channel {
+            "site" => &self.site_token,
+            "crm" => &self.crm_token,
+            _ => return None,
+        };
+        (!token.is_empty()).then_some(token.as_str())
+    }
+
+    /// Site visitors are public. CRM data is internal and may include client
+    /// details, so it must not silently fall back to a cloud model.
+    pub fn default_data_class(&self, channel: &str) -> &'static str {
+        match channel {
+            "crm" => "internal",
+            _ => "public",
+        }
+    }
+
+    pub fn validate_data_class(&self, channel: &str, requested: &str) -> bool {
+        match channel {
+            "site" => requested == "public",
+            "crm" => matches!(requested, "public" | "internal" | "secret"),
+            _ => false,
+        }
+    }
+}

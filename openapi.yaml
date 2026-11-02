@@ -1,0 +1,330 @@
+openapi: "3.1.0"
+info:
+  title: Kiki Assistant Kernel API
+  version: "1.0.0"
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    Central assistant kernel for inteli-dev. Channels call this API with a
+    per-channel bearer token. The kernel owns conversation state, model
+    routing, the tool loop and safety policy. Domain data stays in the site
+    and CRM; the kernel calls their typed internal tools with a service token.
+servers:
+  - url: https://assistant.inteli-dev.ru
+    description: Production
+  - url: http://localhost:8090
+    description: Local development
+tags:
+  - name: Chat
+    description: One message in, one answer out.
+  - name: Conversations
+    description: Conversation history, deletion and out-of-band notes.
+  - name: Health
+    description: Liveness and readiness probes.
+security:
+  - BearerAuth: []
+paths:
+  /v1/chat:
+    post:
+      tags: [Chat]
+      operationId: chat
+      summary: Send one message to Kiki
+      description: |
+        Creates or continues a conversation. The kernel loads the channel
+        profile and tool schemas, routes the request to the local or cloud
+        model, executes tool calls through the channel provider and returns
+        the answer. Internal and secret data require the local route.
+      parameters:
+        - $ref: "#/components/parameters/Channel"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatRequest" }
+            examples:
+              site:
+                summary: Public site question
+                value:
+                  channel: site
+                  message: "Сколько стоит голосовой бот?"
+                  actor: { id: "visitor-hash", role: "visitor" }
+                  data_class: public
+                  context: { url: "https://inteli-dev.ru/services" }
+              crm:
+                summary: CRM operator question
+                value:
+                  channel: crm
+                  message: "Что сегодня в работе?"
+                  conversation_id: "6f1e7f0e-2a6e-4a5a-8e5c-0f6f0f7a1b2c"
+                  actor: { id: "5c1f0e5a-7a6c-4f2f-9c2e-2f7b2a3c4d5e", role: "admin" }
+                  data_class: internal
+      responses:
+        "200":
+          description: Answer and conversation state
+          headers:
+            X-Correlation-Id:
+              schema: { type: string }
+              description: Correlation ID for distributed tracing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/conversations/{conversation_id}:
+    parameters:
+      - $ref: "#/components/parameters/ConversationId"
+      - $ref: "#/components/parameters/Channel"
+    get:
+      tags: [Conversations]
+      operationId: getConversation
+      summary: Read conversation messages
+      responses:
+        "200":
+          description: Conversation messages in chronological order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Conversations]
+      operationId: deleteConversation
+      summary: Delete a conversation and its messages
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/conversations/{conversation_id}/notes:
+    parameters:
+      - $ref: "#/components/parameters/ConversationId"
+      - $ref: "#/components/parameters/Channel"
+    post:
+      tags: [Conversations]
+      operationId: appendNote
+      summary: Append an assistant note after an out-of-band action
+      description: |
+        Used by the CRM after a confirmed action. The note becomes part of the
+        conversation history so the next model call sees the outcome.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, minLength: 1, maxLength: 4000 }
+      responses:
+        "200":
+          description: Stored message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: live
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: live }
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: ready
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          description: Database is reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ready }
+        "503":
+          description: Database is not ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: not_ready }
+                  database: { type: boolean, const: false }
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Per-channel token (`KERNEL_SITE_TOKEN` or `KERNEL_CRM_TOKEN`).
+  parameters:
+    Channel:
+      name: X-Kernel-Channel
+      in: header
+      required: true
+      description: Must match the bearer token channel.
+      schema: { type: string, enum: [site, crm] }
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      schema: { type: string, maxLength: 64 }
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema: { type: string, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" }
+  schemas:
+    Actor:
+      type: object
+      required: [id, role]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 128 }
+        role: { type: string, minLength: 1, maxLength: 64 }
+    ChatRequest:
+      type: object
+      required: [channel, message, actor]
+      properties:
+        channel: { type: string, enum: [site, crm] }
+        message: { type: string, minLength: 1, maxLength: 8000 }
+        conversation_id:
+          type: string
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_-]+$"
+          description: Opaque conversation key. Omit to create a new UUID.
+        actor: { $ref: "#/components/schemas/Actor" }
+        data_class:
+          type: string
+          enum: [public, internal, secret]
+          description: |
+            public may use cloud; internal and secret require the local model
+            unless the operator explicitly allows a cloud fallback.
+        context:
+          type: object
+          additionalProperties: true
+          description: Channel-specific page or UI context.
+    ChatResponse:
+      type: object
+      required: [conversation_id, answer, messages, source, route, model, usage, suggested_next, correlation_id]
+      properties:
+        conversation_id: { type: string, maxLength: 128 }
+        answer: { type: string }
+        message:
+          oneOf:
+            - $ref: "#/components/schemas/Message"
+            - { type: "null" }
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/Message" }
+        source:
+          type: string
+          enum: [kernel:cloud, kernel:local]
+        route: { type: string, enum: [cloud, local] }
+        model: { type: string }
+        usage: { $ref: "#/components/schemas/Usage" }
+        pending_action:
+          oneOf:
+            - $ref: "#/components/schemas/PendingAction"
+            - { type: "null" }
+        suggested_next:
+          type: array
+          items: { $ref: "#/components/schemas/SuggestedAction" }
+        correlation_id: { type: string }
+    ConversationResponse:
+      type: object
+      required: [conversation_id, messages]
+      properties:
+        conversation_id: { type: string, maxLength: 128 }
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/Message" }
+    Message:
+      type: object
+      required: [id, role, content, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        role: { type: string, enum: [system, user, assistant, tool] }
+        content: { type: string }
+        tool_calls:
+          type: array
+          items: { type: object, additionalProperties: true }
+        tool_call_id: { type: string }
+        created_at: { type: string, format: date-time }
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens]
+      properties:
+        prompt_tokens: { type: integer, minimum: 0 }
+        completion_tokens: { type: integer, minimum: 0 }
+    PendingAction:
+      type: object
+      additionalProperties: true
+      description: Domain action prepared by a provider and awaiting confirmation.
+    SuggestedAction:
+      type: object
+      required: [text, type]
+      properties:
+        text: { type: string }
+        type: { type: string }
+    Problem:
+      type: object
+      required: [type, title, status, detail, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code: { type: string }
+        instance: { type: string, format: uri }
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Forbidden:
+      description: Channel, actor or data class is not allowed
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: Conversation not found
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    UpstreamError:
+      description: Model or channel provider failed
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unavailable:
+      description: Required model is unavailable
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
