@@ -7,11 +7,14 @@
 mod api;
 mod config;
 mod error;
+mod harness;
 mod model;
 mod prompt;
 mod provider;
 mod service;
 mod store;
+mod research;
+mod study;
 
 use std::sync::Arc;
 

@@ -1,0 +1,25 @@
+# Lean runtime for site study: the agent needs shell, files and web fetch.
+# Subagents, workflows, MCP and planning inflate the prompt by ~2.6k tokens and
+# are not used by a bounded study.
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: mcp-resources
+  disabled: true
+- id: goal
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: web-search-deepseek
+  disabled: true

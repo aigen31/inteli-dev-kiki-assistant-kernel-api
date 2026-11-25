@@ -83,9 +83,54 @@ pub struct Config {
     pub crm_token: String,
     pub max_tool_steps: usize,
     pub max_message_chars: usize,
+    /// Completion budget. A plan over a long brief needs room for one large
+    /// tool call; 900 was enough for a chat answer but truncated real plans.
+    pub max_output_tokens: u64,
+    /// How many images one user turn may carry.
+    pub max_attachments: usize,
+    /// Per-image byte ceiling. Images are proxied through the channel provider,
+    /// so the kernel holds bytes in memory only while building the model call.
+    pub max_attachment_bytes: usize,
+    /// Whether the routed endpoint accepts OpenAI-style `image_url` parts.
+    /// Local llama.cpp needs a multimodal projector (`--mmproj`) to do so.
+    pub cloud_vision: bool,
+    pub local_vision: bool,
+    /// Site-study runner (DeepSeek Harness sidecar). Empty disables studies.
+    pub harness: HarnessConfig,
+    /// How long a fetched price list stays hot in SQLite.
+    pub pricing_ttl_seconds: u64,
     /// Never true in production for real secret data. It exists for local
     /// development when the local llama.cpp endpoint is not running yet.
     pub allow_cloud_for_internal: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HarnessConfig {
+    pub base_url: String,
+    pub token: String,
+    pub timeout_seconds: u64,
+}
+
+impl HarnessConfig {
+    fn from_env() -> Self {
+        Self {
+            base_url: env::var("KERNEL_HARNESS_URL")
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches('/')
+                .to_string(),
+            token: env::var("KERNEL_HARNESS_TOKEN").unwrap_or_default(),
+            timeout_seconds: env::var("KERNEL_HARNESS_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300u64)
+                .clamp(30, 900),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.is_empty() && !self.token.is_empty()
+    }
 }
 
 impl Config {
@@ -101,16 +146,42 @@ impl Config {
         let max_tool_steps = env::var("KERNEL_MAX_TOOL_STEPS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(4usize)
-            .clamp(1, 8);
+            .unwrap_or(8usize)
+            .clamp(1, 16);
         let max_message_chars = env::var("KERNEL_MAX_MESSAGE_CHARS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(8000usize)
             .clamp(1, 32_000);
+        let max_output_tokens = env::var("KERNEL_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3000u64)
+            .clamp(256, 8000);
         let allow_cloud_for_internal = env::var("KERNEL_ALLOW_CLOUD_FOR_INTERNAL")
             .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
+        let max_attachments = env::var("KERNEL_MAX_ATTACHMENTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4usize)
+            .clamp(0, 8);
+        let max_attachment_bytes = env::var("KERNEL_MAX_ATTACHMENT_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8 * 1024 * 1024)
+            .clamp(64 * 1024, 20 * 1024 * 1024);
+        let cloud_vision = env::var("KERNEL_CLOUD_VISION")
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+        let local_vision = env::var("KERNEL_LOCAL_VISION")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let pricing_ttl_seconds = env::var("KERNEL_PRICING_TTL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(900u64)
+            .clamp(60, 86_400);
 
         Ok(Self {
             bind,
@@ -123,6 +194,13 @@ impl Config {
             crm_token: env::var("KERNEL_CRM_TOKEN").unwrap_or_default(),
             max_tool_steps,
             max_message_chars,
+            max_output_tokens,
+            max_attachments,
+            max_attachment_bytes,
+            cloud_vision,
+            local_vision,
+            harness: HarnessConfig::from_env(),
+            pricing_ttl_seconds,
             allow_cloud_for_internal,
         })
     }
@@ -158,6 +236,15 @@ impl Config {
             "site" => requested == "public",
             "crm" => matches!(requested, "public" | "internal" | "secret"),
             _ => false,
+        }
+    }
+
+    /// Vision support is a property of the endpoint, not of the kernel. A
+    /// local llama.cpp server needs a multimodal projector to accept images.
+    pub fn supports_vision(&self, route: crate::model::Route) -> bool {
+        match route {
+            crate::model::Route::Cloud => self.cloud_vision,
+            crate::model::Route::Local => self.local_vision,
         }
     }
 }

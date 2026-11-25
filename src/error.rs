@@ -32,6 +32,16 @@ impl ApiError {
         Self { status: StatusCode::CONFLICT, code: "conflict", detail: detail.into() }
     }
 
+    /// The request is well-formed but this deployment cannot serve it, for
+    /// example text-only model asked to read an image.
+    pub fn unprocessable(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unprocessable",
+            detail: detail.into(),
+        }
+    }
+
     pub fn upstream(detail: impl Into<String>) -> Self {
         Self { status: StatusCode::BAD_GATEWAY, code: "upstream_error", detail: detail.into() }
     }

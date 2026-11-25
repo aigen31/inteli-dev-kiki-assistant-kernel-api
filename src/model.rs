@@ -13,10 +13,31 @@ use crate::config::ModelConfig;
 use crate::error::{ApiError, ApiResult};
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// OpenAI-compatible multimodal content parts. Only text and images are used:
+/// the kernel never forwards arbitrary file types to a model.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25,15 +46,59 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: Some(content.into()), tool_calls: None, tool_call_id: None }
+        Self {
+            role: "system".into(),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
 
     pub fn assistant(content: impl Into<String>, tool_calls: Option<Value>) -> Self {
-        Self { role: "assistant".into(), content: Some(content.into()), tool_calls, tool_call_id: None }
+        Self {
+            role: "assistant".into(),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls,
+            tool_call_id: None,
+        }
     }
 
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: Some(content.into()), tool_calls: None, tool_call_id: Some(tool_call_id.into()) }
+        Self {
+            role: "tool".into(),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+
+    /// Text plus images encoded as data URLs. Images are sent only with the
+    /// turn that carries them; older turns are replayed as text so a long
+    /// conversation does not re-bill the same pictures on every request.
+    pub fn user_with_images(text: String, images: Vec<String>) -> Self {
+        if images.is_empty() {
+            return Self {
+                role: "user".into(),
+                content: Some(MessageContent::Text(text)),
+                tool_calls: None,
+                tool_call_id: None,
+            };
+        }
+
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        if !text.trim().is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        for image in images {
+            parts.push(ContentPart::ImageUrl { image_url: ImageUrl { url: image } });
+        }
+
+        Self {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(parts)),
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
 }
 
@@ -62,6 +127,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone)]
 pub struct ModelAnswer {
     pub content: String,
+    pub finish_reason: String,
     pub tool_calls: Vec<ToolCall>,
     pub raw_tool_calls: Option<Value>,
     pub prompt_tokens: u64,
@@ -77,6 +143,7 @@ pub struct ModelClient {
     cloud: ModelConfig,
     local: ModelConfig,
     allow_cloud_for_internal: bool,
+    max_output_tokens: u64,
     client: Client,
     breakers: Mutex<HashMap<Route, BreakerState>>,
 }
@@ -85,11 +152,17 @@ const FAILURE_THRESHOLD: u32 = 3;
 const OPEN_SECONDS: u64 = 30;
 
 impl ModelClient {
-    pub fn new(cloud: ModelConfig, local: ModelConfig, allow_cloud_for_internal: bool) -> Self {
+    pub fn new(
+        cloud: ModelConfig,
+        local: ModelConfig,
+        allow_cloud_for_internal: bool,
+        max_output_tokens: u64,
+    ) -> Self {
         Self {
             cloud,
             local,
             allow_cloud_for_internal,
+            max_output_tokens,
             client: Client::builder()
                 .timeout(Duration::from_secs(75))
                 .build()
@@ -170,7 +243,7 @@ impl ModelClient {
             "model": endpoint.model,
             "messages": messages,
             "temperature": 0.4,
-            "max_tokens": 900,
+            "max_tokens": self.max_output_tokens,
             "stream": false,
         });
         if !tools.is_empty() {
@@ -191,7 +264,13 @@ impl ModelClient {
                         let body: Value = response.json().await.map_err(|error| {
                             ApiError::upstream(format!("invalid model response: {error}"))
                         })?;
-                        return parse_response(&body, route);
+                        let answer = parse_response(&body, route)?;
+                        if answer.finish_reason == "length" {
+                            return Err(ApiError::unprocessable(
+                                "Модель не успела закончить ответ и обрезала его. Сократите объём: попросите план частями или увеличьте KERNEL_MAX_OUTPUT_TOKENS.",
+                            ));
+                        }
+                        return Ok(answer);
                     }
                     let body = response.text().await.unwrap_or_default();
                     let detail = format!(
@@ -267,11 +346,15 @@ fn parse_response(body: &Value, route: Route) -> ApiResult<ModelAnswer> {
         .and_then(|choice| choice.get("message"))
         .ok_or_else(|| ApiError::upstream(format!("{} model returned no message", route.label())))?;
 
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let content = match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
 
     let raw_tool_calls = message.get("tool_calls").cloned().filter(|value| value.is_array());
     let mut tool_calls = Vec::new();
@@ -302,8 +385,18 @@ fn parse_response(body: &Value, route: Route) -> ApiResult<ModelAnswer> {
         return Err(ApiError::upstream(format!("{} model returned an empty answer", route.label())));
     }
 
+    let finish_reason = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
     Ok(ModelAnswer {
         content,
+        finish_reason,
         tool_calls,
         raw_tool_calls,
         prompt_tokens: body
@@ -338,6 +431,7 @@ mod tests {
             endpoint("https://cloud.example/v1", "cloud"),
             endpoint("http://local.example/v1", "local"),
             false,
+            3000,
         );
         assert_eq!(models.route_for("public").unwrap(), Route::Cloud);
     }
@@ -348,6 +442,7 @@ mod tests {
             endpoint("https://cloud.example/v1", "cloud"),
             endpoint("http://local.example/v1", "local"),
             false,
+            3000,
         );
         assert_eq!(models.route_for("internal").unwrap(), Route::Local);
         assert_eq!(models.route_for("secret").unwrap(), Route::Local);
@@ -364,6 +459,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
             },
             false,
+            3000,
         );
         assert!(models.route_for("internal").is_err());
     }

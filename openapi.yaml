@@ -10,6 +10,11 @@ info:
     per-channel bearer token. The kernel owns conversation state, model
     routing, the tool loop and safety policy. Domain data stays in the site
     and CRM; the kernel calls their typed internal tools with a service token.
+
+    Sessions (title, pin, archive) and message attachments live here too.
+    Attachments are referenced by id only: the kernel pulls bytes from the
+    channel provider, so the domain keeps storage and access checks.
+  version: "1.3.0"
 servers:
   - url: https://assistant.inteli-dev.ru
     description: Production
@@ -19,7 +24,11 @@ tags:
   - name: Chat
     description: One message in, one answer out.
   - name: Conversations
-    description: Conversation history, deletion and out-of-band notes.
+    description: Sessions, history, renaming, pinning, regeneration and notes.
+  - name: Knowledge
+    description: Shared snapshots owned by a domain service.
+  - name: Studies
+    description: Async site studies executed by the DeepSeek Harness sidecar.
   - name: Health
     description: Liveness and readiness probes.
 security:
@@ -73,8 +82,54 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
         "502": { $ref: "#/components/responses/UpstreamError" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/conversations:
+    get:
+      tags: [Conversations]
+      operationId: listConversations
+      summary: List an actor's sessions
+      description: |
+        Sessions are scoped to the channel token and the actor id. Search
+        matches the title and the user messages of a session.
+      parameters:
+        - $ref: "#/components/parameters/Channel"
+        - name: actor_id
+          in: query
+          required: true
+          schema: { type: string, maxLength: 128 }
+        - name: q
+          in: query
+          required: false
+          schema: { type: string, maxLength: 200 }
+        - name: archived
+          in: query
+          required: false
+          description: "`1`, `true` or `all` also returns archived sessions."
+          schema: { type: string, enum: ["0", "1", "true", "all"] }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: offset
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Sessions, pinned first, then most recently updated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/SessionSummary" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /v1/conversations/{conversation_id}:
     parameters:
       - $ref: "#/components/parameters/ConversationId"
@@ -93,15 +148,210 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Conversations]
+      operationId: updateConversation
+      summary: Rename, pin or archive a session
+      parameters:
+        - name: actor_id
+          in: query
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                title: { type: string, minLength: 1, maxLength: 80 }
+                pinned: { type: boolean }
+                archived: { type: boolean }
+      responses:
+        "200":
+          description: Updated session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionSummary" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
     delete:
       tags: [Conversations]
       operationId: deleteConversation
       summary: Delete a conversation and its messages
+      parameters:
+        - name: actor_id
+          in: query
+          required: true
+          schema: { type: string, maxLength: 128 }
       responses:
         "204": { description: Deleted }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /v1/conversations/{conversation_id}/regenerate:
+    parameters:
+      - $ref: "#/components/parameters/ConversationId"
+      - $ref: "#/components/parameters/Channel"
+    post:
+      tags: [Conversations]
+      operationId: regenerateConversation
+      summary: Re-answer the last user turn
+      description: |
+        Drops the assistant and tool messages after the last user message and
+        runs the turn again. No new user message is stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [actor]
+              properties:
+                actor: { $ref: "#/components/schemas/Actor" }
+                data_class:
+                  type: string
+                  enum: [public, internal, secret]
+                context:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "200":
+          description: New answer for the same user turn
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/knowledge/pricing:
+    get:
+      tags: [Knowledge]
+      operationId: getPricing
+      summary: Shared price snapshot
+      description: |
+        The site owns the price list; the kernel caches a snapshot and serves it
+        to every channel. When the site is down the last snapshot is returned
+        with `stale: true` instead of an empty list.
+      parameters:
+        - $ref: "#/components/parameters/Channel"
+        - name: force
+          in: query
+          required: false
+          schema: { type: string, enum: ["0", "1"] }
+      responses:
+        "200":
+          description: Price snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PriceList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/studies:
+    get:
+      tags: [Studies]
+      operationId: listStudies
+      summary: Studies of an actor
+      parameters:
+        - $ref: "#/components/parameters/Channel"
+        - name: actor_id
+          in: query
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        "200":
+          description: Recent studies
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [studies]
+                properties:
+                  studies:
+                    type: array
+                    items: { $ref: "#/components/schemas/Study" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Studies]
+      operationId: startStudy
+      summary: Start a site study in the harness sidecar
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [actor, url]
+              properties:
+                actor: { $ref: "#/components/schemas/Actor" }
+                url: { type: string, maxLength: 500, description: Public http(s) site only. }
+                focus: { type: string, maxLength: 300 }
+                agents_md: { type: string, maxLength: 60000, description: Existing AGENTS.md to update. }
+                instructions: { type: string, maxLength: 8000 }
+      responses:
+        "200":
+          description: Study created, runner is working
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Study" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/studies/{study_id}:
+    parameters:
+      - name: study_id
+        in: path
+        required: true
+        schema: { type: string, maxLength: 64 }
+      - $ref: "#/components/parameters/Channel"
+      - name: actor_id
+        in: query
+        required: true
+        schema: { type: string, maxLength: 128 }
+    get:
+      tags: [Studies]
+      operationId: getStudy
+      summary: Poll a study, including its event stream and result files
+      responses:
+        "200":
+          description: Current study state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Study" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/studies/{study_id}/cancel:
+    parameters:
+      - name: study_id
+        in: path
+        required: true
+        schema: { type: string, maxLength: 64 }
+      - $ref: "#/components/parameters/Channel"
+      - name: actor_id
+        in: query
+        required: true
+        schema: { type: string, maxLength: 128 }
+    post:
+      tags: [Studies]
+      operationId: cancelStudy
+      summary: Stop a running study
+      responses:
+        "200":
+          description: Cancelled study
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Study" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /v1/conversations/{conversation_id}/notes:
     parameters:
       - $ref: "#/components/parameters/ConversationId"
@@ -171,6 +421,88 @@ paths:
                 properties:
                   status: { type: string, const: not_ready }
                   database: { type: boolean, const: false }
+  /v1/harness/runs:
+    post:
+      tags: [Harness]
+      operationId: startHarnessRun
+      summary: Start a free-form research run in the harness sidecar
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task]
+              properties:
+                task: { type: string, minLength: 8, maxLength: 2000 }
+                url:
+                  type: string
+                  maxLength: 500
+                  description: Optional public http(s) source; the same SSRF guard as studies.
+      responses:
+        "200":
+          description: Run accepted by the harness
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, status]
+                properties:
+                  run_id: { type: string }
+                  status: { type: string, enum: [running] }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/harness/runs/{run_id}:
+    parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema: { type: string, maxLength: 120 }
+      - $ref: "#/components/parameters/Channel"
+    get:
+      tags: [Harness]
+      operationId: getHarnessRun
+      summary: Poll a research run
+      responses:
+        "200":
+          description: Current run state and the final answer when finished
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, status]
+                properties:
+                  run_id: { type: string }
+                  status: { type: string, enum: [running, completed, failed, cancelled] }
+                  answer: { type: string, nullable: true }
+                  error: { type: string, nullable: true }
+                  files:
+                    type: object
+                    additionalProperties: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/harness/runs/{run_id}/cancel:
+    parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema: { type: string, maxLength: 120 }
+      - $ref: "#/components/parameters/Channel"
+    post:
+      tags: [Harness]
+      operationId: cancelHarnessRun
+      summary: Stop a research run
+      responses:
+        "200":
+          description: Cancellation forwarded to the harness
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { type: string }
+                  status: { type: string, enum: [cancelled] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 components:
   securitySchemes:
     BearerAuth:
@@ -224,11 +556,44 @@ components:
           type: object
           additionalProperties: true
           description: Channel-specific page or UI context.
+        attachments:
+          type: array
+          maxItems: 8
+          description: |
+            Images attached to this turn. Only ids are sent; the kernel pulls
+            bytes from the channel provider with its service token. Images are
+            sent to the model on the turn that carries them and are replayed
+            as text afterwards.
+          items: { $ref: "#/components/schemas/Attachment" }
+        documents:
+          type: array
+          maxItems: 5
+          description: |
+            Document manifests. The text stays in the channel; the model reads
+            slices through the provider's `read_document` tool.
+          items: { $ref: "#/components/schemas/DocumentRef" }
+    DocumentRef:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, maxLength: 128 }
+        name: { type: string, maxLength: 255 }
+        mime: { type: string, maxLength: 150 }
+        chars: { type: integer, minimum: 0 }
+        preview: { type: string, maxLength: 500 }
+    Attachment:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" }
+        name: { type: string, maxLength: 255 }
+        mime: { type: string, maxLength: 100 }
     ChatResponse:
       type: object
-      required: [conversation_id, answer, messages, source, route, model, usage, suggested_next, correlation_id]
+      required: [conversation_id, title, answer, messages, source, route, model, usage, suggested_next, correlation_id]
       properties:
         conversation_id: { type: string, maxLength: 128 }
+        title: { type: string, maxLength: 80 }
         answer: { type: string }
         message:
           oneOf:
@@ -250,12 +615,31 @@ components:
         suggested_next:
           type: array
           items: { $ref: "#/components/schemas/SuggestedAction" }
+        trace:
+          type: array
+          items: { $ref: "#/components/schemas/TraceStep" }
         correlation_id: { type: string }
+    SessionSummary:
+      type: object
+      required: [id, title, pinned, archived, message_count, preview, created_at, updated_at]
+      properties:
+        id: { type: string, maxLength: 128 }
+        title: { type: string, maxLength: 80 }
+        pinned: { type: boolean }
+        archived: { type: boolean }
+        data_class: { type: string, enum: [public, internal, secret] }
+        message_count: { type: integer, minimum: 0 }
+        preview: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     ConversationResponse:
       type: object
-      required: [conversation_id, messages]
+      required: [conversation_id, title, pinned, archived, messages]
       properties:
         conversation_id: { type: string, maxLength: 128 }
+        title: { type: string, maxLength: 80 }
+        pinned: { type: boolean }
+        archived: { type: boolean }
         messages:
           type: array
           items: { $ref: "#/components/schemas/Message" }
@@ -270,6 +654,13 @@ components:
           type: array
           items: { type: object, additionalProperties: true }
         tool_call_id: { type: string }
+        attachments:
+          type: array
+          items: { $ref: "#/components/schemas/Attachment" }
+          description: Image and document references carried by a user turn.
+        trace:
+          type: array
+          items: { $ref: "#/components/schemas/TraceStep" }
         created_at: { type: string, format: date-time }
     Usage:
       type: object
@@ -287,6 +678,55 @@ components:
       properties:
         text: { type: string }
         type: { type: string }
+    TraceStep:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [note, tool] }
+        step: { type: integer, minimum: 1 }
+        name: { type: string }
+        status: { type: string, enum: [ok, error] }
+        text: { type: string }
+        summary: { type: string }
+        duration_ms: { type: integer, minimum: 0 }
+    PriceList:
+      type: object
+      required: [items]
+      properties:
+        updated_at: { type: string }
+        cached: { type: boolean }
+        stale: { type: boolean }
+        cached_at: { type: string }
+        items:
+          type: array
+          items:
+            type: object
+            required: [title, price_from]
+            properties:
+              slug: { type: string }
+              title: { type: string }
+              description: { type: string }
+              price_from: { type: string }
+              unit: { type: string }
+    Study:
+      type: object
+      required: [id, status, url]
+      properties:
+        id: { type: string }
+        url: { type: string }
+        focus: { type: string }
+        status: { type: string, enum: [queued, running, completed, failed, cancelled] }
+        runner_run_id: { type: string }
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        agents_md: { type: string }
+        notes: { type: string }
+        error: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     Problem:
       type: object
       required: [type, title, status, detail, code]
@@ -320,6 +760,11 @@ components:
           schema: { $ref: "#/components/schemas/Problem" }
     UpstreamError:
       description: Model or channel provider failed
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unprocessable:
+      description: The routed model or deployment cannot serve this request
       content:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }

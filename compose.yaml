@@ -8,6 +8,10 @@ services:
     image: inteli-dev-kiki-assistant-kernel-api:0.1.0
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Инструмент research ждёт ответ harness до 45 с — колбэк провайдера
+      # (CRM) должен переживать такой вызов. Остальные инструменты быстрые.
+      KERNEL_PROVIDER_TIMEOUT_SECONDS: ${KERNEL_PROVIDER_TIMEOUT_SECONDS:-60}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -23,6 +27,37 @@ services:
       retries: 3
       start_period: 10s
 
+  # Long-running site studies. The kernel submits a job and polls it, so a chat
+  # request never waits minutes for a browser-like agent.
+  harness:
+    build:
+      context: ./harness
+      dockerfile: Dockerfile
+    image: inteli-dev-kiki-harness-runner:0.1.0
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8090"
+      DATA_DIR: /data
+      DSH_HOME: /data/dsh-home
+      HARNESS_TOKEN: ${KERNEL_HARNESS_TOKEN:-dev-harness-token}
+      CRM_MCP_URL: ${CRM_MCP_URL:-http://crm-nginx/api/mcp}
+      CRM_MCP_TOKEN: ${MCP_TOKEN:-dev-mcp-token}
+      DEEPSEEK_API_KEY: ${KERNEL_CLOUD_API_KEY:-}
+      MAX_CONCURRENT: "2"
+      DEFAULT_TIMEOUT: "300"
+    volumes:
+      - harness-data:/data
+    networks:
+      - assistant
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
 networks:
   assistant:
     name: inteli-dev-assistant
@@ -31,3 +66,5 @@ networks:
 volumes:
   kernel-data:
     name: inteli-dev-kernel-data
+  harness-data:
+    name: inteli-dev-kernel-harness
